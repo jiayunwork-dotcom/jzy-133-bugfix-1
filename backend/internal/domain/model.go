@@ -58,7 +58,7 @@ type Subgroup struct {
 	Values []float64 `json:"values"`
 }
 
-// Baseline 一段冻结的控制限及其生效区间（留档用）。
+// Baseline 一段冻结的控制限及其实际接管区间（留档用）。
 type Baseline struct {
 	ID            int64    `json:"id"`
 	Version       int      `json:"version"`

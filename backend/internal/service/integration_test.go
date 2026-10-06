@@ -14,6 +14,7 @@ import (
 	"os"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/lib/pq"
 
@@ -24,7 +25,7 @@ import (
 	"spc/internal/store"
 )
 
-func openSvc(t *testing.T) (*service.Service, context.Context) {
+func openSvc(t *testing.T) (*service.Service, *store.DB, context.Context) {
 	t.Helper()
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
@@ -55,13 +56,31 @@ func openSvc(t *testing.T) (*service.Service, context.Context) {
 	if err := migrate.New(db, root.MigrationsFS).Up(ctx); err != nil {
 		t.Fatalf("迁移: %v", err)
 	}
-	return service.New(store.New(db)), ctx
+	return service.New(store.New(db)), store.New(db), ctx
 }
 
 func mustTarget(t *testing.T, svc *service.Service, ctx context.Context, n int) domain.Target {
 	t.Helper()
-	usl, lsl := 20.0, 0.0
-	tgt, err := svc.CreateTarget(ctx, domain.TargetSpec{
+	tgt, err := svc.CreateTarget(ctx, makeTargetSpec(t, n, 20.0, 0.0))
+	if err != nil {
+		t.Fatalf("建档: %v", err)
+	}
+	return tgt
+}
+
+func ingestGroup(t *testing.T, svc *service.Service, ctx context.Context,
+	targetID int64, vals []float64) {
+	t.Helper()
+	if _, err := svc.Ingest(ctx, service.IngestRequest{
+		TargetID: targetID, Values: vals, Grouped: true,
+	}); err != nil {
+		t.Fatalf("录入子组: %v", err)
+	}
+}
+
+func makeTargetSpec(t *testing.T, n int, usl, lsl float64) domain.Target {
+	t.Helper()
+	return domain.TargetSpec{
 		Name:         fmt.Sprintf("轴 %p", t),
 		Machine:      "CNC-01",
 		Dimension:    "外径",
@@ -69,17 +88,280 @@ func mustTarget(t *testing.T, svc *service.Service, ctx context.Context, n int) 
 		LSL:          &lsl,
 		SubgroupN:    n,
 		EnabledRules: []int{1, 2, 3, 4},
-	})
+	}
+}
+
+// TestIntegrationRebaselineDoesNotReattributeHistory 复现外圆磨床档案：
+// v1 用 1..20 冻结，21..40 已在漂移中产生告警；再以 11..30 重新基准。
+// 31..40 的点和全部旧告警必须继续挂 v1；新限从 41 开始，且跨窗口规则不把旧点带入。
+func TestIntegrationRebaselineDoesNotReattributeHistory(t *testing.T) {
+	svc, _, ctx := openSvc(t)
+	const n = 5
+	usl, lsl := 10.5, 9.5
+	tgt, err := svc.CreateTarget(ctx, makeTargetSpec(t, n, usl, lsl))
 	if err != nil {
 		t.Fatalf("建档: %v", err)
 	}
-	return tgt
+
+	offsets := []float64{-0.06, -0.03, 0.0, 0.03, 0.06}
+	groupVals := func(mean float64) []float64 {
+		out := make([]float64, n)
+		for i := range out {
+			out[i] = mean + offsets[i]
+		}
+		return out
+	}
+
+	for g := 1; g <= 20; g++ {
+		ingestGroup(t, svc, ctx, tgt.ID, groupVals(10.0))
+	}
+	bl1, err := svc.CreateBaseline(ctx, tgt.ID, 1, 20)
+	if err != nil {
+		t.Fatalf("冻结 v1: %v", err)
+	}
+
+	// 21..40 从 10.00 起每组上漂 0.03，在 v1 下产生漂移/越界告警。
+	for g := 21; g <= 40; g++ {
+		ingestGroup(t, svc, ctx, tgt.ID, groupVals(10+float64(g-20)*0.03))
+	}
+	before, err := svc.GetSeries(ctx, tgt.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldAlarmCount := len(before.Alarms)
+	if oldAlarmCount == 0 {
+		t.Fatal("漂移子组在 v1 下应产生告警")
+	}
+	for _, a := range before.Alarms {
+		if a.BaselineID == nil || *a.BaselineID != bl1.ID {
+			t.Fatalf("重新基准前告警应挂 v1：%+v", a)
+		}
+	}
+
+	// 基准期故意取在中间（11..30），旧限必须保留到 40，新限只从 41 接管。
+	bl2, err := svc.CreateBaseline(ctx, tgt.ID, 11, 30)
+	if err != nil {
+		t.Fatalf("重新基准: %v", err)
+	}
+	if bl2.EffectiveFrom != 41 {
+		t.Fatalf("新限应从下一个新子组 41 生效，实际 %d", bl2.EffectiveFrom)
+	}
+	after, err := svc.GetSeries(ctx, tgt.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after.Alarms) != oldAlarmCount {
+		t.Fatalf("重新基准本身不得新增/删除告警，旧告警 %d 条，实际 %d 条",
+			oldAlarmCount, len(after.Alarms))
+	}
+	for seq := 31; seq <= 40; seq++ {
+		p := after.Points[seq-1]
+		if p.BaselineID == nil || *p.BaselineID != bl1.ID {
+			t.Fatalf("第 %d 组必须继续挂 v1，实际 %+v", seq, p.BaselineID)
+		}
+	}
+	for _, a := range after.Alarms {
+		if a.BaselineID == nil || *a.BaselineID != bl1.ID {
+			t.Fatalf("旧告警不得改挂新限：%+v", a)
+		}
+	}
+	v1, v2 := after.Baselines[0], after.Baselines[1]
+	if v1.EffectiveTo == nil || *v1.EffectiveTo != 40 || !v2.Active {
+		t.Fatalf("生效区间错误：v1=%+v v2=%+v", v1, v2)
+	}
+
+	// 连续两次重新基准、中间没有新子组：v2 是 41..40 的空留档版本，v3 从 41 接管。
+	bl3, err := svc.CreateBaseline(ctx, tgt.ID, 12, 31)
+	if err != nil {
+		t.Fatalf("第二次重新基准: %v", err)
+	}
+	if bl3.EffectiveFrom != 41 {
+		t.Fatalf("空 v2 后的 v3 仍应从下一实际新点 41 生效，实际 %d", bl3.EffectiveFrom)
+	}
+	series, err := svc.GetSeries(ctx, tgt.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(series.Baselines) != 3 {
+		t.Fatalf("应保留 3 个基准版本，实际 %d", len(series.Baselines))
+	}
+	if series.Baselines[1].EffectiveTo == nil ||
+		*series.Baselines[1].EffectiveTo != 40 {
+		t.Fatalf("v2 应为空留档区间 41..40，实际 %+v", series.Baselines[1])
+	}
+	if len(series.Alarms) != oldAlarmCount {
+		t.Fatalf("连续空重新基准不得补告警，旧 %d 条，实际 %d 条",
+			oldAlarmCount, len(series.Alarms))
+	}
+	for _, a := range series.Alarms {
+		if a.BaselineID == nil || *a.BaselineID != bl1.ID {
+			t.Fatalf("空版本切换不得改挂历史告警：%+v", a)
+		}
+	}
+
+	// 第 41 组：在 v3 限内（远离 2σ 线）。若错误带入旧点，会因旧窗口延续触发
+	// 规则 2/4；版本边界重置后，单独一个新限点不应产生任何告警。
+	ingestGroup(t, svc, ctx, tgt.ID, groupVals(10.10))
+	series, err = svc.GetSeries(ctx, tgt.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(series.Alarms) != oldAlarmCount {
+		t.Fatalf("新限首个受控点不应把旧窗口带入而补告警，旧 %d 条，实际 %d 条",
+			oldAlarmCount, len(series.Alarms))
+	}
+	if p := series.Points[40]; p.BaselineID == nil || *p.BaselineID != bl3.ID {
+		t.Fatalf("第41组应挂重新基准后的 v3，实际 %+v", p.BaselineID)
+	}
+
+	// 基准期恰好取当前末尾（21~40）时，下一限也必须只影响后续新组。
+	if _, err := svc.CreateBaseline(ctx, tgt.ID, 21, 40); err != nil {
+		t.Fatalf("末尾基准期重新基准: %v", err)
+	}
+	series, err = svc.GetSeries(ctx, tgt.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(series.Baselines) != 4 {
+		t.Fatalf("末尾基准期版本后应保留 4 个版本，实际 %d", len(series.Baselines))
+	}
+	if to := series.Baselines[2].EffectiveTo; to == nil || *to != 41 {
+		t.Fatalf("第41组之后立即再重基准时，v3 应只留档到41，实际 %+v", to)
+	}
+	if got := series.Baselines[len(series.Baselines)-1].EffectiveFrom; got != 42 {
+		t.Fatalf("末尾基准期版本应从 42 生效，实际 %d", got)
+	}
+	if p := series.Points[40]; p.BaselineID == nil || *p.BaselineID != bl3.ID {
+		t.Fatalf("已判定的第41组不得因再次重新基准改挂，实际 %+v", p.BaselineID)
+	}
+}
+
+// TestIntegrationRebaselineConcurrentWithPaste 验证重新基准与整列粘贴串行化：
+// 同一批切出的所有子组必须全部归属同一限版本，不能半批旧限、半批新限。
+func TestIntegrationRebaselineConcurrentWithPaste(t *testing.T) {
+	svc, db, ctx := openSvc(t)
+	const n = 5
+	usl, lsl := 10.5, 9.5
+	tgt, err := svc.CreateTarget(ctx, makeTargetSpec(t, n, usl, lsl))
+	if err != nil {
+		t.Fatalf("建档: %v", err)
+	}
+	for g := 0; g < 40; g++ {
+		ingestGroup(t, svc, ctx, tgt.ID,
+			[]float64{9.94, 9.97, 10.0, 10.03, 10.06})
+	}
+	if _, err := svc.CreateBaseline(ctx, tgt.ID, 1, 20); err != nil {
+		t.Fatal(err)
+	}
+
+	holder, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := holder.ExecContext(ctx,
+		`SELECT id FROM targets WHERE id=$1 FOR UPDATE`, tgt.ID); err != nil {
+		t.Fatalf("外部持锁: %v", err)
+	}
+	t.Cleanup(func() { _ = holder.Rollback() })
+
+	ingDone := make(chan error, 1)
+	go func() {
+		values := make([]float64, 5*n)
+		for i := range values {
+			values[i] = 10.2
+		}
+		_, err := svc.Ingest(ctx, service.IngestRequest{
+			TargetID: tgt.ID,
+			Values:   values,
+			Grouped:  false,
+		})
+		ingDone <- err
+	}()
+
+	waitBlocked := make(chan error, 1)
+	go func() {
+		var blocked bool
+		for i := 0; i < 100; i++ {
+			var waiting int
+			err := db.QueryRowContext(ctx, `
+				SELECT count(*)
+				FROM pg_stat_activity
+				WHERE wait_event_type = 'Lock'
+				  AND query LIKE '%FOR UPDATE%'`,
+			).Scan(&waiting)
+			if err != nil {
+				waitBlocked <- err
+				return
+			}
+			if waiting > 0 {
+				blocked = true
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if !blocked {
+			waitBlocked <- fmt.Errorf("未等到录入事务等待目标行锁")
+		}
+		close(waitBlocked)
+	}()
+	if err := <-waitBlocked; err != nil {
+		t.Fatal(err)
+	}
+
+	rebDone := make(chan error, 1)
+	go func() {
+		// 录入已先进入等待队列；发起重新基准，证明两个操作最终由行锁串行化。
+		_, err := svc.CreateBaseline(ctx, tgt.ID, 11, 30)
+		rebDone <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
+	if err := holder.Commit(); err != nil {
+		t.Fatalf("释放外部锁: %v", err)
+	}
+	if err := <-ingDone; err != nil {
+		t.Fatalf("等待后的录入: %v", err)
+	}
+	if err := <-rebDone; err != nil {
+		t.Fatalf("等待后的重新基准: %v", err)
+	}
+
+	series, err := svc.GetSeries(ctx, tgt.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := series.Points[40]
+	if p.BaselineID == nil {
+		t.Fatal("第41组必须固化归属，不能为 NULL")
+	}
+	batchID := *p.BaselineID
+	for seq := 41; seq <= 45; seq++ {
+		p := series.Points[seq-1]
+		if p.BaselineID == nil || *p.BaselineID != batchID {
+			t.Fatalf("同一次流式粘贴的第 %d 组被分到不同限：第41组=%d，本组=%+v",
+				seq, batchID, p.BaselineID)
+		}
+	}
+	if batchID == series.Baselines[0].ID {
+		if to := series.Baselines[0].EffectiveTo; to == nil || *to != 45 {
+			t.Fatalf("粘贴先获锁时 v1 应到45，实际 %+v", to)
+		}
+		if from := series.Baselines[1].EffectiveFrom; from != 46 {
+			t.Fatalf("粘贴先获锁时 v2 应从46开始，实际 %d", from)
+		}
+	} else {
+		if to := series.Baselines[0].EffectiveTo; to == nil || *to != 40 {
+			t.Fatalf("重新基准先获锁时 v1 应到40，实际 %+v", to)
+		}
+		if from := series.Baselines[1].EffectiveFrom; from != 41 {
+			t.Fatalf("重新基准先获锁时 v2 应从41开始，实际 %d", from)
+		}
+	}
 }
 
 // TestIntegrationConcurrentIngest 两个检验员同时往同一档录入：
 // 子组不丢不重、顺序与服务器点序一致，且粘贴批次连续入序。
 func TestIntegrationConcurrentIngest(t *testing.T) {
-	svc, ctx := openSvc(t)
+	svc, _, ctx := openSvc(t)
 	const n = 5
 	tgt := mustTarget(t, svc, ctx, n)
 
@@ -135,7 +417,7 @@ func TestIntegrationConcurrentIngest(t *testing.T) {
 // TestIntegrationStreamingGroupsByServerOrder 流式粘贴 + 错峰补齐：
 // 先录入 n-1 个散点，再一次粘贴一整列，验证残留与新点连续拼成子组。
 func TestIntegrationStreamingGroupsByServerOrder(t *testing.T) {
-	svc, ctx := openSvc(t)
+	svc, _, ctx := openSvc(t)
 	const n = 4
 	tgt := mustTarget(t, svc, ctx, n)
 
@@ -177,7 +459,7 @@ func TestIntegrationStreamingGroupsByServerOrder(t *testing.T) {
 // TestIntegrationBaselineFreezeAndRebaseline 冻结后再录限不变；
 // 重新基准旧限留档、历史点仍挂旧限；重放告警与在线告警一致。
 func TestIntegrationBaselineFreezeAndRebaseline(t *testing.T) {
-	svc, ctx := openSvc(t)
+	svc, _, ctx := openSvc(t)
 	const n = 5
 	tgt := mustTarget(t, svc, ctx, n)
 

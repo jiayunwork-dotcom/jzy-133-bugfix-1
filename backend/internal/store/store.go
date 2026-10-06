@@ -27,10 +27,11 @@ type TargetRow struct {
 
 // SubgroupRow subgroups 表一行。
 type SubgroupRow struct {
-	Seq       int
-	Mean      float64
-	Range     float64
-	CreatedAt time.Time
+	Seq        int
+	Mean       float64
+	Range      float64
+	BaselineID sql.NullInt64
+	CreatedAt  time.Time
 }
 
 // BaselineRow baselines 表一行。
@@ -55,8 +56,9 @@ type BaselineRow struct {
 
 // AlarmRow alarms 表一行。
 type AlarmRow struct {
-	Rule        int
-	TriggerSeq  int
+	BaselineID int64
+	Rule       int
+	TriggerSeq int
 	InvolvedSeq pq.Int64Array
 	CreatedAt   time.Time
 }

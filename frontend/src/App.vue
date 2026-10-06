@@ -48,7 +48,7 @@
         </div>
 
         <ControlChart :series="series" />
-        <AlarmList :alarms="series.alarms" />
+        <AlarmList :alarms="series.alarms" :baselines="series.baselines" />
         <BaselinePanel
           :series="series"
           @changed="refresh"

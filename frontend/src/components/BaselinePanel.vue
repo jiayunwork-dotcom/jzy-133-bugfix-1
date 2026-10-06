@@ -20,7 +20,7 @@
           <tr v-for="b in series.baselines" :key="b.id">
             <td>v{{ b.version }}</td>
             <td>{{ b.refStartSeq }}~{{ b.refEndSeq }}</td>
-            <td>{{ b.effectiveFrom }}~{{ b.effectiveTo ?? '至今' }}</td>
+            <td>{{ intervalText(b) }}</td>
             <td>{{ f(b.xbarBar) }}</td>
             <td>{{ f(b.rbar) }}</td>
             <td>{{ f(b.uclX) }}</td>
@@ -90,6 +90,13 @@ const cap = computed(() => props.series.capabilityBaseline)
 function f(v) {
   if (v == null) return '—'
   return Number(v).toFixed(5).replace(/0+$/, '').replace(/\.$/, '')
+}
+
+function intervalText(b) {
+  if (b.effectiveTo != null && b.effectiveFrom > b.effectiveTo) {
+    return `空留档（预留从 ${b.effectiveFrom}）`
+  }
+  return `${b.effectiveFrom}~${b.effectiveTo ?? '至今'}`
 }
 
 async function submit() {

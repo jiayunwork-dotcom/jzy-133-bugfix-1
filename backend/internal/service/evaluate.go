@@ -3,37 +3,26 @@ package service
 import (
 	"context"
 	"database/sql"
-	"errors"
 
 	"spc/internal/domain"
 	"spc/internal/store"
 )
 
-// evaluateForLockedTarget 在已持有目标行锁的事务内：
-// 取当前开放基准与全部子组，对生效区间（seq >= effective_from）重放判异，
-// 与已存告警键比较，只插入新出现的告警，并返回新告警列表。
+// evaluateForLockedTarget 在已持有目标行锁、且当前开放基准为 bl 的事务内，
+// 只对该版本生效区间内的子组从头重放判异。
 //
-// 评估是纯函数的从头重放，所以：
-//   - 同一段数据反复评估结果完全一致；
-//   - 新点只会让 (rule, triggerSeq) 集合扩大，已出告警不会消失；
-//   - 逐点在线追加（每次录入重放至当前尾部）与一次性从头重放完全等价。
+// 这是版本内重放，不是全局重放：跨版本的规则 2/3/4 滑动窗口在边界处重置，
+// 旧限下的点不会喂给新限。告警幂等键包含 baseline_id，因此同一规则/触发点
+// 可以分别记录其在不同限版本下的判定结果；版本内重放只插入新增告警。
 func (s *Service) evaluateForLockedTarget(ctx context.Context, tx *sql.Tx,
-	tgt domain.Target) ([]domain.Alarm, error) {
-	bl, err := store.OpenBaselineInTx(ctx, tx, tgt.ID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil // 尚未冻结基准，不判异
-	}
-	if err != nil {
-		return nil, err
-	}
-
+	tgt domain.Target, bl store.BaselineRow) ([]domain.Alarm, error) {
 	sgRows, err := store.ListSubgroupsInTx(ctx, tx, tgt.ID)
 	if err != nil {
 		return nil, err
 	}
 	sgs := make([]domain.Subgroup, 0, len(sgRows))
 	for _, r := range sgRows {
-		if r.Seq < bl.EffectiveFrom {
+		if !r.BaselineID.Valid || r.BaselineID.Int64 != bl.ID {
 			continue
 		}
 		sgs = append(sgs, domain.Subgroup{Seq: r.Seq, Mean: r.Mean, Range: r.Range})
@@ -50,7 +39,7 @@ func (s *Service) evaluateForLockedTarget(ctx context.Context, tx *sql.Tx,
 	}
 	candidates := domain.EvaluateMeans(sgs, lim, enabled)
 
-	existing, err := store.ExistingAlarmKeysInTx(ctx, tx, tgt.ID)
+	existing, err := store.ExistingAlarmKeysInTx(ctx, tx, tgt.ID, bl.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -59,7 +48,7 @@ func (s *Service) evaluateForLockedTarget(ctx context.Context, tx *sql.Tx,
 		if existing[[2]int{a.Rule, a.TriggerSeq}] {
 			continue
 		}
-		if err := store.InsertAlarmIgnore(ctx, tx, tgt.ID,
+		if err := store.InsertAlarmIgnore(ctx, tx, tgt.ID, bl.ID,
 			a.Rule, a.TriggerSeq, a.InvolvedSeq); err != nil {
 			return nil, err
 		}

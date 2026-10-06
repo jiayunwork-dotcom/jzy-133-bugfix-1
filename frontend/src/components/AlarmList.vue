@@ -1,6 +1,6 @@
 <template>
   <div class="panel">
-    <h2>判异告警 <span class="muted">（共 {{ alarms.length }} 条，只增不删）</span></h2>
+    <h2>判异告警 <span class="muted">（共 {{ alarms.length }} 条，重新基准不删旧告警）</span></h2>
     <div v-if="!alarms.length" class="success">当前无告警</div>
     <div v-else class="table-wrap">
       <table>
@@ -19,7 +19,7 @@
             </td>
             <td class="alarm-cell">第 {{ a.triggerSeq }} 组</td>
             <td style="text-align:left">{{ formatInvolved(a.involvedSeq) }}</td>
-            <td>{{ a.baselineId ? ('#' + a.baselineId) : '—' }}</td>
+            <td>{{ baselineVersion(a.baselineId) }}</td>
           </tr>
         </tbody>
       </table>
@@ -28,7 +28,15 @@
 </template>
 
 <script setup>
-defineProps({ alarms: { type: Array, required: true } })
+const props = defineProps({
+  alarms: { type: Array, required: true },
+  baselines: { type: Array, default: () => [] }
+})
+
+function baselineVersion(id) {
+  const b = props.baselines.find((x) => x.id === id)
+  return b ? `v${b.version}` : '—'
+}
 
 // 把连续序号压缩成区间，如 3,4,5,6,7,8 -> 3~8
 function formatInvolved(seq) {

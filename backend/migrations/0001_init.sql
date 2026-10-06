@@ -31,6 +31,7 @@ CREATE TABLE subgroups (
     seq           INTEGER      NOT NULL,
     mean          DOUBLE PRECISION NOT NULL,
     range         DOUBLE PRECISION NOT NULL,
+    baseline_id   BIGINT,
     created_at    TIMESTAMPTZ  NOT NULL DEFAULT now(),
     PRIMARY KEY (target_id, seq)
 );
@@ -57,18 +58,20 @@ CREATE TABLE baselines (
     CONSTRAINT baselines_target_ver UNIQUE (target_id, version)
 );
 
--- 告警只增不改不删（重新基准不删除，仅后续新限产生新告警）。
+-- 告警归属按判定时的限版本固化；正常业务只增不改不删。
 CREATE TABLE alarms (
     target_id     BIGINT      NOT NULL REFERENCES targets(id),
+    baseline_id   BIGINT      NOT NULL REFERENCES baselines(id),
     rule_no       INTEGER     NOT NULL,
     trigger_seq   INTEGER     NOT NULL,
     involved_seq  INTEGER[]   NOT NULL,
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (target_id, rule_no, trigger_seq)
+    PRIMARY KEY (target_id, baseline_id, rule_no, trigger_seq)
 );
 
 CREATE INDEX idx_measurements_pending ON measurements(target_id, seq)
     WHERE subgroup_seq IS NULL;
 CREATE INDEX idx_subgroups_target ON subgroups(target_id, seq);
 CREATE INDEX idx_baselines_target ON baselines(target_id, version);
-CREATE INDEX idx_alarms_target ON alarms(target_id, trigger_seq);
+CREATE INDEX idx_alarms_target ON alarms(target_id, baseline_id, trigger_seq);
+CREATE INDEX idx_subgroups_baseline ON subgroups(target_id, baseline_id);

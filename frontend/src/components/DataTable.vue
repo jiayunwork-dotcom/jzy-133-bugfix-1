@@ -19,7 +19,7 @@
             <td v-for="i in series.subgroupN" :key="i">{{ fmt(p.values[i-1]) }}</td>
             <td>{{ fmt(p.mean) }}</td>
             <td>{{ fmt(p.range) }}</td>
-            <td>{{ p.baselineId ? ('v' + versionOf(p.baselineId)) : '基准期' }}</td>
+            <td>{{ p.baselineId ? ('v' + versionOf(p.baselineId)) : '未判定' }}</td>
             <td class="alarm-cell">{{ p.rules.length ? '规则' + p.rules.join('、') : '' }}</td>
           </tr>
         </tbody>

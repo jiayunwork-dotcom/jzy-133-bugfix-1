@@ -12,8 +12,7 @@ import (
 
 // IngestRequest 一次录入。
 // Grouped=true 表示「整组录入」：值数必须恰为子组容量 n（否则报容量不符），
-//
-//	且在本次入序内优先切成整组（若此前有残留散点，会先与残留点合并）。
+// 且在本次入序内单独切成一组（若此前有残留散点会拒绝）。
 //
 // Grouped=false 表示「流式粘贴」：任意数量，按服务器点序连续入序，凑满即切。
 type IngestRequest struct {
@@ -62,6 +61,19 @@ func (s *Service) Ingest(ctx context.Context, req IngestRequest) (IngestResult, 
 		}
 		res.PendingBefore = pendingBefore
 
+		// 在切组前取得当前开放限。目标行锁让基准创建与录入互斥：若整批粘贴先提交，
+		// 所有新点都归旧限；若重新基准先提交，则整批都归新限，绝不会半批两半。
+		activeBaseline, err := store.OpenBaselineInTx(ctx, tx, req.TargetID)
+		hasBaseline := true
+		if errors.Is(err, sql.ErrNoRows) {
+			hasBaseline = false
+		} else if err != nil {
+			return err
+		}
+		baselineID := sql.NullInt64{}
+		if hasBaseline {
+			baselineID = sql.NullInt64{Int64: activeBaseline.ID, Valid: true}
+		}
 		if req.Grouped {
 			// 整组模式：本次 n 个值必须单独成组。若流式录入留有未凑满的散点，
 			// 按服务器点序它们必须排在队头，无法让本次值单独成组，显式报错，
@@ -98,22 +110,18 @@ func (s *Service) Ingest(ctx context.Context, req IngestRequest) (IngestResult, 
 			lastSeq++
 			sg := domain.MakeSubgroup(lastSeq, vals)
 			if err := store.CreateSubgroup(ctx, tx, req.TargetID,
-				sg.Seq, sg.Mean, sg.Range, seqs); err != nil {
+				sg.Seq, sg.Mean, sg.Range, seqs, baselineID); err != nil {
 				return err
 			}
 			res.NewSubgroups = append(res.NewSubgroups, sg)
 		}
 		res.PendingAfter = pendingBefore + len(req.Values) - len(res.NewSubgroups)*tgt.SubgroupN
 
-		// 3) 冻结限存在时，对生效区间重放判异，只插入新告警。
+		// 3) 冻结限存在时，只在当前限版本内重放，插入新告警。
 		res.NewAlarms = []domain.Alarm{}
-		blRows, err := store.ListBaselinesInTx(ctx, tx, req.TargetID)
-		if err != nil {
-			return err
-		}
-		res.BaselineReady = len(blRows) > 0
-		if len(res.NewSubgroups) > 0 && res.BaselineReady {
-			alarms, err := s.evaluateForLockedTarget(ctx, tx, tgt)
+		res.BaselineReady = hasBaseline
+		if len(res.NewSubgroups) > 0 && hasBaseline {
+			alarms, err := s.evaluateForLockedTarget(ctx, tx, tgt, activeBaseline)
 			if err != nil {
 				return err
 			}

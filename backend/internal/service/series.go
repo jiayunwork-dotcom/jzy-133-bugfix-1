@@ -35,7 +35,7 @@ type PointDTO struct {
 	Mean       float64   `json:"mean"`
 	Range      float64   `json:"range"`
 	Values     []float64 `json:"values"`
-	BaselineID *int64    `json:"baselineId"` // 该点判定时生效的限；基准期内为 null
+	BaselineID *int64 `json:"baselineId"` // 判定时固化的限版本；未判定点为 null
 }
 
 type AlarmDTO struct {
@@ -120,7 +120,6 @@ func (s *Service) GetSeries(ctx context.Context, id int64) (SeriesDTO, error) {
 	}
 
 	// 基线列表，含画图线段范围。
-	byID := map[int64]BaselineDTO{}
 	for _, b := range blRows {
 		bd := baselineToDTO(toDomainBaseline(b))
 		// 线段：首版从其基准期起点开始画；后续版本从生效起点画。
@@ -130,51 +129,27 @@ func (s *Service) GetSeries(ctx context.Context, id int64) (SeriesDTO, error) {
 		}
 		bd.LineTo = bd.EffectiveTo
 		bd.Active = !b.EffectiveTo.Valid
-		byID[b.ID] = bd
 		dto.Baselines = append(dto.Baselines, bd)
 	}
 
-	// 点归属到「判定时生效的基准」：
-	// 基准期参考点无基准；之后按版本顺序匹配 [effective_from, effective_to]。
+	// 点归属在切组/首版补判时已经固化。这里绝不按当前生效区间重算，
+	// 否则中间基准期的重新基准会改写历史点的归属。
 	for i, r := range sgRows {
 		vals := values[i]
 		if vals == nil {
 			vals = []float64{}
 		}
 		p := PointDTO{Seq: r.Seq, Mean: r.Mean, Range: r.Range, Values: vals}
-		for _, b := range blRows {
-			if r.Seq >= b.RefStartSeq && r.Seq <= b.RefEndSeq {
-				p.BaselineID = nil
-				break
-			}
-			to := 1 << 30
-			if b.EffectiveTo.Valid {
-				to = int(b.EffectiveTo.Int64)
-			}
-			if r.Seq >= b.EffectiveFrom && r.Seq <= to {
-				idv := b.ID
-				p.BaselineID = &idv
-				break
-			}
+		if r.BaselineID.Valid {
+			id := r.BaselineID.Int64
+			p.BaselineID = &id
 		}
 		dto.Points = append(dto.Points, p)
 	}
 
-	// 告警。
+	// 告警归属在判定时随告警落库；重新基准不会重挂或删除旧告警。
 	for _, a := range alRows {
-		var blid *int64
-		// 找到触发点当时生效的限。
-		for _, b := range blRows {
-			to := 1 << 30
-			if b.EffectiveTo.Valid {
-				to = int(b.EffectiveTo.Int64)
-			}
-			if a.TriggerSeq >= b.EffectiveFrom && a.TriggerSeq <= to {
-				idv := b.ID
-				blid = &idv
-				break
-			}
-		}
+		id := a.BaselineID
 		inv := make([]int, len(a.InvolvedSeq))
 		for i, v := range a.InvolvedSeq {
 			inv[i] = int(v)
@@ -184,7 +159,7 @@ func (s *Service) GetSeries(ctx context.Context, id int64) (SeriesDTO, error) {
 			RuleName:    domain.RuleName(a.Rule),
 			TriggerSeq:  a.TriggerSeq,
 			InvolvedSeq: inv,
-			BaselineID:  blid,
+			BaselineID:  &id,
 		})
 	}
 	dto.InControl = len(alRows) == 0

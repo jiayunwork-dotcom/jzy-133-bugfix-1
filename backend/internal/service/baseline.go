@@ -11,12 +11,13 @@ import (
 
 // CreateBaseline 显式发起基准：用 [startSeq,endSeq] 这段连续子组（>=20 个）
 // 计算中心线/控制限并冻结。已有的开放基准被关闭并留档，其 effective_to
-// 置为新基准生效起点-1；新基准对 endSeq 之后录入的子组生效。
+// 置为新基准实际生效起点-1。
 //
-// 首次基准：参考子组之外此前没有生效限，因此对生效区间做一次判异重放，
-// 使基准建立那一刻的状态与「当时在线」一致。
-// 重新基准：旧限期间的告警已按旧限落库且只增不删，新限不回溯判定任何旧点，
-// 历史点仍按当时生效的限显示。
+// 首次基准：参考子组之外此前没有生效限，因此把基准建立时已存在的后续子组按
+// 这一版限补判并固化归属，使冻结时刻的状态与「当时在线」一致。
+// 重新基准：新限只对获得行锁后新切出的完整子组生效；已经判定的子组和告警
+// 不按新限重判。即使基准期跨在前一版生效区间中间，effectiveFrom 也取当前
+// 最后一个完整子组之后，而不是 refEndSeq+1。
 func (s *Service) CreateBaseline(ctx context.Context, targetID int64,
 	startSeq, endSeq int) (domain.Baseline, error) {
 	var out domain.Baseline
@@ -65,9 +66,20 @@ func (s *Service) CreateBaseline(ctx context.Context, targetID int64,
 		if err != nil {
 			return err
 		}
+		// 首次基准允许对建限前已存在、参考期之后的子组补判；重新基准则把新限
+		// 起点推迟到当前最后完整子组之后，任何历史点都不回溯。
+		isFirst := len(oldBaselines) == 0
 		effectiveFrom := endSeq + 1
-		if len(oldBaselines) > 0 {
-			// 关闭旧的开放限：生效至新限起点前一点。
+		if !isFirst {
+			// 重新基准只接管获得目标行锁后切出的完整子组。基准期本身是参考数据，
+			// 所以至少从 ref_end_seq+1 预留；若当时已有更靠后的完整子组，则从其后开始。
+			if len(sgRows) > 0 {
+				if next := sgRows[len(sgRows)-1].Seq + 1; next > effectiveFrom {
+					effectiveFrom = next
+				}
+			}
+			// 关闭旧的开放限：生效至新限实际接管前一点；两次重基准之间没有
+			// 新子组时，允许产生一个空的留档版本。
 			if err := store.CloseOpenBaseline(ctx, tx, targetID, effectiveFrom-1); err != nil {
 				return err
 			}
@@ -93,19 +105,24 @@ func (s *Service) CreateBaseline(ctx context.Context, targetID int64,
 			return err
 		}
 
-		// 仅首次基准对生效区间重放告警；重新基准不回溯。
-		if len(oldBaselines) == 0 {
-			if _, err := s.evaluateForLockedTarget(ctx, tx, tgt); err != nil {
-				return err
-			}
-		}
-
 		row, err := store.OpenBaselineInTx(ctx, tx, targetID)
 		if err != nil {
 			return err
 		}
+
+		// 首次基准需要给建限前已存在、且位于参考期之后的点补判；先固化点归属，
+		// 再只在这一版限的区间内重放。重新基准不执行，任何旧点都不回溯。
+		if isFirst {
+			if _, err := store.AssignBaselineToExistingSubgroups(
+				ctx, tx, targetID, id, effectiveFrom); err != nil {
+				return err
+			}
+			if _, err := s.evaluateForLockedTarget(ctx, tx, tgt, row); err != nil {
+				return err
+			}
+		}
+
 		out = toDomainBaseline(row)
-		_ = id
 		return nil
 	})
 	if err != nil {

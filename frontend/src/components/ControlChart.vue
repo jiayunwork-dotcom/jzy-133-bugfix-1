@@ -180,15 +180,19 @@ const segments = computed(() => {
       ucl: b[key === 'x' ? 'uclX' : 'uclR'],
       cl: b[key === 'x' ? 'xbarBar' : 'rbar'],
       lcl: b[key === 'x' ? 'lclX' : 'lclR']
-    })).filter((s) => s.from <= maxSeq.value)
+    })).filter((s) => s.from <= maxSeq.value && s.from <= s.to)
   return { x: mk('x'), r: mk('r') }
 })
 
 const boundaries = computed(() =>
   limitBases.value
     .filter((b) => b.version > 1)
-    .map((b) => ({ seq: b.effectiveFrom - 1, version: b.version }))
-    .filter((b) => b.seq >= 1 && b.seq < maxSeq.value)
+    .map((b) => ({
+      seq: b.effectiveFrom - 1,
+      version: b.version,
+      empty: b.effectiveTo != null && b.effectiveTo < b.effectiveFrom
+    }))
+    .filter((b) => !b.empty && b.seq >= 1 && b.seq <= maxSeq.value)
 )
 
 const specLines = computed(() => {
@@ -233,7 +237,9 @@ function styleFor(p, valueKey) {
     if (al.involved.size) { stroke = '#d12f2f'; sw = 2; fill = '#ffffff' }
     if (al.trigger.length) { fill = '#d12f2f'; stroke = '#8c1d1d'; r = 5.5 }
   }
-  const ver = p.baselineId == null ? '基准期参考' : `限版本 v${baselineVersion.value.get(p.baselineId)}`
+  const ver = p.baselineId == null
+    ? '未按冻结限判定点'
+    : `限版本 v${baselineVersion.value.get(p.baselineId)}`
   const alarmTxt = al
     ? `｜告警规则：${[...new Set([...al.trigger, ...al.involved])].sort().join('、')}`
     : ''

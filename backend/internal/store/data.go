@@ -57,10 +57,11 @@ func PendingMeasurements(ctx context.Context, tx *sql.Tx, targetID int64,
 
 // CreateSubgroup 落一个切好的子组，并把对应散点标记为属于该子组。
 func CreateSubgroup(ctx context.Context, tx *sql.Tx, targetID int64,
-	seq int, mean, rng float64, pointSeqs []int64) error {
+	seq int, mean, rng float64, pointSeqs []int64, baselineID sql.NullInt64) error {
 	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO subgroups (target_id, seq, mean, range) VALUES ($1,$2,$3,$4)`,
-		targetID, seq, mean, rng); err != nil {
+		INSERT INTO subgroups (target_id, seq, mean, range, baseline_id)
+		VALUES ($1,$2,$3,$4,$5)`,
+		targetID, seq, mean, rng, baselineID); err != nil {
 		return err
 	}
 	_, err := tx.ExecContext(ctx, `
@@ -70,10 +71,24 @@ func CreateSubgroup(ctx context.Context, tx *sql.Tx, targetID int64,
 	return err
 }
 
+// AssignBaselineToExistingSubgroups 固化首版基准对建限前已存在点的判定归属。
+// 只有尚未归属任何限、且从 effectiveFrom 起的完整子组会被更新；基准参考点仍为 NULL。
+func AssignBaselineToExistingSubgroups(ctx context.Context, tx *sql.Tx,
+	targetID, baselineID int64, effectiveFrom int) (int64, error) {
+	res, err := tx.ExecContext(ctx, `
+		UPDATE subgroups SET baseline_id=$2
+		WHERE target_id=$1 AND baseline_id IS NULL AND seq >= $3`,
+		targetID, baselineID, effectiveFrom)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 // ListSubgroups 取全部子组（升序）。
 func (db *DB) ListSubgroups(ctx context.Context, targetID int64) ([]SubgroupRow, error) {
 	rows, err := db.QueryContext(ctx, `
-		SELECT seq, mean, range, created_at
+		SELECT seq, mean, range, baseline_id, created_at
 		FROM subgroups WHERE target_id=$1 ORDER BY seq`, targetID)
 	if err != nil {
 		return nil, err
@@ -85,7 +100,7 @@ func (db *DB) ListSubgroups(ctx context.Context, targetID int64) ([]SubgroupRow,
 // ListSubgroupsInTx 事务内取全部子组（升序）。
 func ListSubgroupsInTx(ctx context.Context, tx *sql.Tx, targetID int64) ([]SubgroupRow, error) {
 	rows, err := tx.QueryContext(ctx,
-		`SELECT seq, mean, range, created_at FROM subgroups
+		`SELECT seq, mean, range, baseline_id, created_at FROM subgroups
 		 WHERE target_id=$1 ORDER BY seq`, targetID)
 	if err != nil {
 		return nil, err
@@ -98,7 +113,7 @@ func scanSubgroupRows(rows *sql.Rows) ([]SubgroupRow, error) {
 	var out []SubgroupRow
 	for rows.Next() {
 		var s SubgroupRow
-		if err := rows.Scan(&s.Seq, &s.Mean, &s.Range, &s.CreatedAt); err != nil {
+		if err := rows.Scan(&s.Seq, &s.Mean, &s.Range, &s.BaselineID, &s.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, s)

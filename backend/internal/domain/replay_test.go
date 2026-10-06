@@ -62,6 +62,19 @@ func TestOnlineAppendEqualsFullReplay(t *testing.T) {
 	}
 }
 
+// TestRuleWindowsRestartAtBaselineBoundary 验证重新基准后的规则窗口不读取旧限点。
+// 第 1 个新限点若与旧限最后 8 点同侧，不能触发规则 2；规则 4 也不能把旧点拉入窗口。
+func TestRuleWindowsRestartAtBaselineBoundary(t *testing.T) {
+	en := rules(RuleSameSide9, RuleTrend6, RuleTwoOfThree2s)
+
+	// 新限中心线为 12；仅传入归属于新限的 41 号点。旧限点 33..40 即使在新坐标上
+	// 都高于中心线且已连续上升，也不应参与判定。
+	got := Evaluate([]point{{seq: 41, mean: 12.2}}, 12, 14, 10, en)
+	if len(got) != 0 {
+		t.Fatalf("新限首个点不得带入旧窗口告警，实际 %+v", got)
+	}
+}
+
 // TestRepeatedEvaluationDeterministic 同一段数据反复评估必须逐条一致。
 func TestRepeatedEvaluationDeterministic(t *testing.T) {
 	center, ucl, lcl := 100.0, 106.0, 94.0
