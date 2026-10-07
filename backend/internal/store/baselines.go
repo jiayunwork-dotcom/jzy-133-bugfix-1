@@ -107,3 +107,42 @@ func scanBaselineRows(rows *sql.Rows) ([]BaselineRow, error) {
 	}
 	return out, rows.Err()
 }
+
+// CountJudgedByBaselinesInTx 事务内返回 baselineID -> 实际判定（归属）的子组数。
+// 连续重新基准、中间没录新子组时，中间版本可能判定 0 个子组。
+func CountJudgedByBaselinesInTx(ctx context.Context, tx *sql.Tx,
+	targetID int64) (map[int64]int, error) {
+	return countJudged(ctx, targetID, tx)
+}
+
+// CountJudgedByBaselines 非事务版本（读视图用）。
+func (db *DB) CountJudgedByBaselines(ctx context.Context,
+	targetID int64) (map[int64]int, error) {
+	return countJudged(ctx, targetID, db)
+}
+
+// querier *sql.DB 与 *sql.Tx 共同满足的查询接口。
+type querier interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+func countJudged(ctx context.Context, targetID int64, q querier) (map[int64]int, error) {
+	rows, err := q.QueryContext(ctx,
+		`SELECT baseline_id, count(*) FROM subgroups
+		 WHERE target_id=$1 AND baseline_id IS NOT NULL
+		 GROUP BY baseline_id`, targetID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[int64]int{}
+	for rows.Next() {
+		var id int64
+		var n int
+		if err := rows.Scan(&id, &n); err != nil {
+			return nil, err
+		}
+		out[id] = n
+	}
+	return out, rows.Err()
+}

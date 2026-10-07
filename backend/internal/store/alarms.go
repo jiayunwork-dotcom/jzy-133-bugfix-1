@@ -8,26 +8,27 @@ import (
 )
 
 // InsertAlarmIgnore 幂等写入一条告警：(target, rule, trigger) 已存在则跳过。
-// 已出告警只增不删，保证重复评估结果一致。
+// 已出告警只增不删，保证重复评估结果一致。baselineID 是判定时归属的限版本，
+// 在首次写入时一并冻结（重复评估必然属于同一套限）。
 func InsertAlarmIgnore(ctx context.Context, tx *sql.Tx, targetID int64,
-	rule int, triggerSeq int, involved []int) error {
+	rule int, triggerSeq int, involved []int, baselineID int64) error {
 	arr := make(pq.Int64Array, len(involved))
 	for i, v := range involved {
 		arr[i] = int64(v)
 	}
 	_, err := tx.ExecContext(ctx, `
-		INSERT INTO alarms (target_id, rule_no, trigger_seq, involved_seq)
-		VALUES ($1,$2,$3,$4)
+		INSERT INTO alarms (target_id, rule_no, trigger_seq, involved_seq, baseline_id)
+		VALUES ($1,$2,$3,$4,$5)
 		ON CONFLICT (target_id, rule_no, trigger_seq) DO NOTHING`,
-		targetID, rule, triggerSeq, arr)
+		targetID, rule, triggerSeq, arr, baselineID)
 	return err
 }
 
-const alarmCols = `rule_no, trigger_seq, involved_seq, created_at`
+const alarmCols = `rule_no, trigger_seq, involved_seq, baseline_id, created_at`
 
 func scanAlarm(s rowScanner) (AlarmRow, error) {
 	var a AlarmRow
-	err := s.Scan(&a.Rule, &a.TriggerSeq, &a.InvolvedSeq, &a.CreatedAt)
+	err := s.Scan(&a.Rule, &a.TriggerSeq, &a.InvolvedSeq, &a.BaselineID, &a.CreatedAt)
 	return a, err
 }
 
@@ -55,11 +56,13 @@ func ListAlarmsInTx(ctx context.Context, tx *sql.Tx, targetID int64) ([]AlarmRow
 	return scanAlarmRows(rows)
 }
 
-// ExistingAlarmKeysInTx 批量取出已存在的告警键 (rule, triggerSeq)，用于重放后只插新增。
+// ExistingAlarmKeysInTx 批量取出某套限下已存在的告警键 (rule, triggerSeq)，
+// 用于该限重放后只插新增。告警按归属限分区评估，不与其它版本混在一起。
 func ExistingAlarmKeysInTx(ctx context.Context, tx *sql.Tx,
-	targetID int64) (map[[2]int]bool, error) {
+	targetID, baselineID int64) (map[[2]int]bool, error) {
 	rows, err := tx.QueryContext(ctx,
-		`SELECT rule_no, trigger_seq FROM alarms WHERE target_id=$1`, targetID)
+		`SELECT rule_no, trigger_seq FROM alarms
+		 WHERE target_id=$1 AND baseline_id=$2`, targetID, baselineID)
 	if err != nil {
 		return nil, err
 	}

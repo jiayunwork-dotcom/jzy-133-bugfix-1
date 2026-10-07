@@ -77,6 +77,9 @@ func (s *Service) Ingest(ctx context.Context, req IngestRequest) (IngestResult, 
 		}
 
 		// 2) 从队头开始，每凑满 n 个散点切一个子组。
+		//    子组切出的那一刻归属哪套开放限，当场落库；整次粘贴在同一事务、
+		//    同一把目标行锁内完成，与并发的重新基准严格串行——一次整列粘贴
+		//    不可能一半旧限、一半新限。
 		res.NewSubgroups = []domain.Subgroup{}
 		lastSeq, err := store.LastSubgroupSeq(ctx, tx, req.TargetID)
 		if err != nil {
@@ -86,6 +89,15 @@ func (s *Service) Ingest(ctx context.Context, req IngestRequest) (IngestResult, 
 			((pendingBefore+len(req.Values))/tgt.SubgroupN)*tgt.SubgroupN)
 		if err != nil {
 			return err
+		}
+		openBL, openErr := store.OpenBaselineInTx(ctx, tx, req.TargetID)
+		hasBaseline := openErr == nil
+		if openErr != nil && !errors.Is(openErr, sql.ErrNoRows) {
+			return openErr
+		}
+		var stampBL sql.NullInt64
+		if hasBaseline {
+			stampBL = sql.NullInt64{Int64: openBL.ID, Valid: true}
 		}
 		for start := 0; start+tgt.SubgroupN <= len(pending); start += tgt.SubgroupN {
 			chunk := pending[start : start+tgt.SubgroupN]
@@ -98,22 +110,19 @@ func (s *Service) Ingest(ctx context.Context, req IngestRequest) (IngestResult, 
 			lastSeq++
 			sg := domain.MakeSubgroup(lastSeq, vals)
 			if err := store.CreateSubgroup(ctx, tx, req.TargetID,
-				sg.Seq, sg.Mean, sg.Range, seqs); err != nil {
+				sg.Seq, sg.Mean, sg.Range, seqs, stampBL); err != nil {
 				return err
 			}
 			res.NewSubgroups = append(res.NewSubgroups, sg)
 		}
 		res.PendingAfter = pendingBefore + len(req.Values) - len(res.NewSubgroups)*tgt.SubgroupN
 
-		// 3) 冻结限存在时，对生效区间重放判异，只插入新告警。
+		// 3) 冻结限存在时，只对「本次切组归属的那套限」重放判异，只插新增告警。
+		//    重放输入仅含归属该限的点，故窗口规则不会跨进旧限的点。
 		res.NewAlarms = []domain.Alarm{}
-		blRows, err := store.ListBaselinesInTx(ctx, tx, req.TargetID)
-		if err != nil {
-			return err
-		}
-		res.BaselineReady = len(blRows) > 0
-		if len(res.NewSubgroups) > 0 && res.BaselineReady {
-			alarms, err := s.evaluateForLockedTarget(ctx, tx, tgt)
+		res.BaselineReady = hasBaseline
+		if len(res.NewSubgroups) > 0 && hasBaseline {
+			alarms, err := s.evaluateBaselineInTx(ctx, tx, tgt, openBL)
 			if err != nil {
 				return err
 			}

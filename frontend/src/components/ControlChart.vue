@@ -168,28 +168,63 @@ function y(v, sc) {
   return m.t + chartH - ((v - sc.min) / (sc.max - sc.min)) * chartH
 }
 
-// 每条基准在图上画成一个限段：[lineFrom, lineTo ?? maxSeq]
+// 每条基准在图上画成一个限段，范围取它「实际判定点」的序号区间；
+// 判定 0 个子组的版本（连续重基、中间没录新子组）不画限段，避免一段没有
+// 任何点的限段盖住真正生效的那段。
 const limitBases = computed(() => props.series.baselines || [])
+
+// 每版限实际判定点的序号范围（点的归属是落库事实）。
+// 限段必须画在「真正按这套限判定的点」下方——跨边界重新基准时，旧限的
+// 判定点可能越过它的登记生效终点（如 v1 判到 40、区间却止于 30），此时
+// 31~40 下方仍应画 v1 的限线。判定 0 组的版本不画。
+const judgedRange = computed(() => {
+  const range = new Map()
+  for (const p of props.series.points) {
+    if (p.baselineId == null) continue
+    const cur = range.get(p.baselineId)
+    if (!cur) range.set(p.baselineId, { from: p.seq, to: p.seq })
+    else { cur.from = Math.min(cur.from, p.seq); cur.to = Math.max(cur.to, p.seq) }
+  }
+  return range
+})
 
 const segments = computed(() => {
   const mk = (key) =>
-    limitBases.value.map((b) => ({
-      version: b.version,
-      from: Math.max(1, b.lineFrom),
-      to: b.lineTo ?? maxSeq.value,
-      ucl: b[key === 'x' ? 'uclX' : 'uclR'],
-      cl: b[key === 'x' ? 'xbarBar' : 'rbar'],
-      lcl: b[key === 'x' ? 'lclX' : 'lclR']
-    })).filter((s) => s.from <= maxSeq.value)
+    limitBases.value
+      .map((b) => {
+        const jr = judgedRange.value.get(b.id)
+        if (!jr) return null // 判定 0 个子组的版本不画限段
+        // 首版把参考期也纳入（限线画过它自己的参考点）；后续版本从首个判定点起。
+        const from = b.version === 1 ? Math.min(b.refStartSeq, jr.from) : jr.from
+        // 开放中的限画到当前末点；已留档限画到它最后一个判定点。
+        const to = b.effectiveTo == null ? maxSeq.value : Math.max(jr.to, b.effectiveTo)
+        return {
+          version: b.version,
+          from: Math.max(1, from),
+          to,
+          ucl: b[key === 'x' ? 'uclX' : 'uclR'],
+          cl: b[key === 'x' ? 'xbarBar' : 'rbar'],
+          lcl: b[key === 'x' ? 'lclX' : 'lclR']
+        }
+      })
+      .filter((s) => s && s.from <= maxSeq.value)
   return { x: mk('x'), r: mk('r') }
 })
 
-const boundaries = computed(() =>
-  limitBases.value
-    .filter((b) => b.version > 1)
-    .map((b) => ({ seq: b.effectiveFrom - 1, version: b.version }))
+// 分界竖线画在「真正换限判定」的位置：新版本实际判定的第一组之前。
+// 判定 0 组的中间版本不产生分界（数据上没有任何点换过限）。
+const boundaries = computed(() => {
+  const judgedFrom = new Map()
+  for (const p of props.series.points) {
+    if (p.baselineId != null && !judgedFrom.has(p.baselineId)) {
+      judgedFrom.set(p.baselineId, p.seq)
+    }
+  }
+  return limitBases.value
+    .filter((b) => b.version > 1 && judgedFrom.has(b.id))
+    .map((b) => ({ seq: judgedFrom.get(b.id) - 1, version: b.version }))
     .filter((b) => b.seq >= 1 && b.seq < maxSeq.value)
-)
+})
 
 const specLines = computed(() => {
   const t = props.series.target
@@ -225,6 +260,8 @@ function styleFor(p, valueKey) {
   let stroke = '#2b5d8a'
   let sw = 1
   let r = 4
+  // 灰点：没有判定归属的点——基准期参考点，或首次基准前录入、未判定的点。
+  // 判定归属（baselineId）与参考属性（refBaselineId）相互独立。
   if (p.baselineId == null) {
     fill = '#c4ccd4'
     stroke = '#8a94a0'
@@ -233,7 +270,18 @@ function styleFor(p, valueKey) {
     if (al.involved.size) { stroke = '#d12f2f'; sw = 2; fill = '#ffffff' }
     if (al.trigger.length) { fill = '#d12f2f'; stroke = '#8c1d1d'; r = 5.5 }
   }
-  const ver = p.baselineId == null ? '基准期参考' : `限版本 v${baselineVersion.value.get(p.baselineId)}`
+  let ver
+  if (p.baselineId == null) {
+    ver = p.refBaselineId == null
+      ? '未判定（基准前）'
+      : `v${baselineVersion.value.get(p.refBaselineId)} 基准期参考点`
+  } else {
+    ver = `限版本 v${baselineVersion.value.get(p.baselineId)}`
+    // 该点按某套限判定过，又被后来的基准选作参考期：两个身份都展示。
+    if (p.refBaselineId != null && p.refBaselineId !== p.baselineId) {
+      ver += `，同时是 v${baselineVersion.value.get(p.refBaselineId)} 参考期点`
+    }
+  }
   const alarmTxt = al
     ? `｜告警规则：${[...new Set([...al.trigger, ...al.involved])].sort().join('、')}`
     : ''

@@ -56,11 +56,13 @@ func PendingMeasurements(ctx context.Context, tx *sql.Tx, targetID int64,
 }
 
 // CreateSubgroup 落一个切好的子组，并把对应散点标记为属于该子组。
+// baselineID 为该子组判定时点归属的冻结限；尚未建立基准时为 nil（参考/未判定点）。
 func CreateSubgroup(ctx context.Context, tx *sql.Tx, targetID int64,
-	seq int, mean, rng float64, pointSeqs []int64) error {
+	seq int, mean, rng float64, pointSeqs []int64, baselineID sql.NullInt64) error {
 	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO subgroups (target_id, seq, mean, range) VALUES ($1,$2,$3,$4)`,
-		targetID, seq, mean, rng); err != nil {
+		INSERT INTO subgroups (target_id, seq, mean, range, baseline_id)
+		VALUES ($1,$2,$3,$4,$5)`,
+		targetID, seq, mean, rng, baselineID); err != nil {
 		return err
 	}
 	_, err := tx.ExecContext(ctx, `
@@ -70,10 +72,28 @@ func CreateSubgroup(ctx context.Context, tx *sql.Tx, targetID int64,
 	return err
 }
 
+// AssignSubgroupsBaseline 把若干尚无归属的子组一次性盖到某套限上
+// （首次基准时，把此前录下、未判定的子组认作该限的判定点）。
+func AssignSubgroupsBaseline(ctx context.Context, tx *sql.Tx,
+	targetID int64, baselineID int64, seqs []int) error {
+	if len(seqs) == 0 {
+		return nil
+	}
+	arr := make(pq.Int64Array, len(seqs))
+	for i, s := range seqs {
+		arr[i] = int64(s)
+	}
+	_, err := tx.ExecContext(ctx, `
+		UPDATE subgroups SET baseline_id=$2
+		WHERE target_id=$1 AND seq = ANY($3) AND baseline_id IS NULL`,
+		targetID, baselineID, arr)
+	return err
+}
+
 // ListSubgroups 取全部子组（升序）。
 func (db *DB) ListSubgroups(ctx context.Context, targetID int64) ([]SubgroupRow, error) {
 	rows, err := db.QueryContext(ctx, `
-		SELECT seq, mean, range, created_at
+		SELECT seq, mean, range, baseline_id, created_at
 		FROM subgroups WHERE target_id=$1 ORDER BY seq`, targetID)
 	if err != nil {
 		return nil, err
@@ -85,8 +105,22 @@ func (db *DB) ListSubgroups(ctx context.Context, targetID int64) ([]SubgroupRow,
 // ListSubgroupsInTx 事务内取全部子组（升序）。
 func ListSubgroupsInTx(ctx context.Context, tx *sql.Tx, targetID int64) ([]SubgroupRow, error) {
 	rows, err := tx.QueryContext(ctx,
-		`SELECT seq, mean, range, created_at FROM subgroups
+		`SELECT seq, mean, range, baseline_id, created_at FROM subgroups
 		 WHERE target_id=$1 ORDER BY seq`, targetID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanSubgroupRows(rows)
+}
+
+// ListSubgroupsByBaselineInTx 事务内取归属于某套限的全部子组（升序）。
+// 判异重放只喂同一套限的点，因此跨版本的前向窗口天然在版本边界处重置。
+func ListSubgroupsByBaselineInTx(ctx context.Context, tx *sql.Tx,
+	targetID, baselineID int64) ([]SubgroupRow, error) {
+	rows, err := tx.QueryContext(ctx,
+		`SELECT seq, mean, range, baseline_id, created_at FROM subgroups
+		 WHERE target_id=$1 AND baseline_id=$2 ORDER BY seq`, targetID, baselineID)
 	if err != nil {
 		return nil, err
 	}
@@ -98,7 +132,7 @@ func scanSubgroupRows(rows *sql.Rows) ([]SubgroupRow, error) {
 	var out []SubgroupRow
 	for rows.Next() {
 		var s SubgroupRow
-		if err := rows.Scan(&s.Seq, &s.Mean, &s.Range, &s.CreatedAt); err != nil {
+		if err := rows.Scan(&s.Seq, &s.Mean, &s.Range, &s.BaselineID, &s.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, s)

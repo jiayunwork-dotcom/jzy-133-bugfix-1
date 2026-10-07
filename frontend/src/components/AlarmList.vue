@@ -19,7 +19,7 @@
             </td>
             <td class="alarm-cell">第 {{ a.triggerSeq }} 组</td>
             <td style="text-align:left">{{ formatInvolved(a.involvedSeq) }}</td>
-            <td>{{ a.baselineId ? ('#' + a.baselineId) : '—' }}</td>
+            <td>{{ baselineText(a) }}</td>
           </tr>
         </tbody>
       </table>
@@ -28,7 +28,17 @@
 </template>
 
 <script setup>
-defineProps({ alarms: { type: Array, required: true } })
+const props = defineProps({
+  alarms: { type: Array, required: true },
+  baselines: { type: Array, default: () => [] }
+})
+
+// 告警挂的是「判定那一刻」的限版本（落库），重新基准后不会改挂。
+function baselineText(a) {
+  if (a.baselineId == null) return '—'
+  const b = props.baselines.find((x) => x.id === a.baselineId)
+  return b ? `v${b.version}` : `#${a.baselineId}`
+}
 
 // 把连续序号压缩成区间，如 3,4,5,6,7,8 -> 3~8
 function formatInvolved(seq) {

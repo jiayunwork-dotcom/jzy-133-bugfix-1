@@ -11,7 +11,8 @@
       <table style="margin-bottom:10px">
         <thead>
           <tr>
-            <th>版本</th><th>基准期子组</th><th>生效区间</th>
+            <th>版本</th><th>基准期子组</th><th>开放区间</th>
+            <th>判定子组数</th>
             <th>X̄̄</th><th>R̄</th><th>UCLx</th><th>LCLx</th>
             <th>UCLr</th><th>LCLr</th><th>σ(组内)</th><th>状态</th>
           </tr>
@@ -21,6 +22,12 @@
             <td>v{{ b.version }}</td>
             <td>{{ b.refStartSeq }}~{{ b.refEndSeq }}</td>
             <td>{{ b.effectiveFrom }}~{{ b.effectiveTo ?? '至今' }}</td>
+            <td>
+              {{ b.judgedCount }}
+              <span v-if="b.judgedCount === 0" class="muted" title="该版本建立后没有录入过新子组，下一次重新基准前没有任何点按它判定">
+                （未判定）
+              </span>
+            </td>
             <td>{{ f(b.xbarBar) }}</td>
             <td>{{ f(b.rbar) }}</td>
             <td>{{ f(b.uclX) }}</td>
@@ -65,6 +72,7 @@
         </button>
         <span class="muted" style="margin-top:14px">
           当前共 {{ series.points.length }} 个子组；基准期至少 20 个。
+          重新基准只对之后新录入的子组生效；已判定的点和已出告警仍挂在当时的限上，不会改判。
         </span>
       </div>
       <div v-if="error" class="error">{{ error }}</div>

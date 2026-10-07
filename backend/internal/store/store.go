@@ -27,10 +27,11 @@ type TargetRow struct {
 
 // SubgroupRow subgroups 表一行。
 type SubgroupRow struct {
-	Seq       int
-	Mean      float64
-	Range     float64
-	CreatedAt time.Time
+	Seq        int
+	Mean       float64
+	Range      float64
+	BaselineID sql.NullInt64 // 判定时点归属的限；基准期/尚未判定为 NULL
+	CreatedAt  time.Time
 }
 
 // BaselineRow baselines 表一行。
@@ -58,6 +59,7 @@ type AlarmRow struct {
 	Rule        int
 	TriggerSeq  int
 	InvolvedSeq pq.Int64Array
+	BaselineID  sql.NullInt64 // 判定时挂的限版本（告警只属于一套限）
 	CreatedAt   time.Time
 }
 
